@@ -252,6 +252,44 @@ func (c *LruCache[K, V]) Delete(key K) {
 	c.mu.Unlock()
 }
 
+// DeleteIf removes the value associated with key only when match returns true.
+// The check and delete are performed under the cache lock.
+func (c *LruCache[K, V]) DeleteIf(key K, match func(V) bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if le, ok := c.cache[key]; ok && match(le.Value.value) {
+		c.deleteElement(le)
+	}
+}
+
+// PeekWithLifetime returns the value and expiry without changing recent-ness.
+func (c *LruCache[K, V]) PeekWithLifetime(key K) (value V, lifetime time.Time, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	le, ok := c.cache[key]
+	if !ok {
+		return value, time.Time{}, false
+	}
+	return le.Value.value, time.Unix(le.Value.expires, 0), true
+}
+
+// UpdateLifetime extends the expiry of key only when match returns true.
+// The check and update are performed under the cache lock.
+func (c *LruCache[K, V]) UpdateLifetime(key K, match func(V) bool, lifetime time.Duration) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	le, ok := c.cache[key]
+	if !ok || !match(le.Value.value) {
+		return false
+	}
+	le.Value.expires = time.Now().Add(lifetime).Unix()
+	c.lru.MoveToBack(le)
+	return true
+}
+
 func (c *LruCache[K, V]) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()

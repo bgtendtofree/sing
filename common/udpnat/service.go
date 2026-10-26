@@ -25,38 +25,56 @@ type Handler interface {
 }
 
 type Service[K comparable] struct {
-	nat       *cache.LruCache[K, *conn]
-	handler   Handler
-	handlerEx N.UDPConnectionHandlerEx
+	nat        *cache.LruCache[K, *conn]
+	handler    Handler
+	handlerEx  N.UDPConnectionHandlerEx
+	dropOnFull bool
 }
 
 // Deprecated: Use NewEx instead.
 func New[K comparable](maxAge int64, handler Handler) *Service[K] {
+	return NewWithCapacity[K](maxAge, 0, false, handler)
+}
+
+// NewWithCapacity creates a legacy packet service with an optional session
+// cap. When dropOnFull is true, a full per-session queue drops the datagram
+// instead of blocking the shared reader.
+//
+// Deprecated: Use NewExWithCapacity instead.
+func NewWithCapacity[K comparable](maxAge int64, maxEntries int, dropOnFull bool, handler Handler) *Service[K] {
 	service := &Service[K]{
-		nat: cache.New(
-			cache.WithAge[K, *conn](maxAge),
-			cache.WithUpdateAgeOnGet[K, *conn](),
-			cache.WithEvict[K, *conn](func(key K, conn *conn) {
-				conn.Close()
-			}),
-		),
-		handler: handler,
+		nat:        newCache[K](maxAge, maxEntries),
+		handler:    handler,
+		dropOnFull: dropOnFull,
 	}
 	return service
 }
 
 func NewEx[K comparable](maxAge int64, handler N.UDPConnectionHandlerEx) *Service[K] {
+	return NewExWithCapacity[K](maxAge, 0, false, handler)
+}
+
+func NewExWithCapacity[K comparable](maxAge int64, maxEntries int, dropOnFull bool, handler N.UDPConnectionHandlerEx) *Service[K] {
 	service := &Service[K]{
-		nat: cache.New(
-			cache.WithAge[K, *conn](maxAge),
-			cache.WithUpdateAgeOnGet[K, *conn](),
-			cache.WithEvict[K, *conn](func(key K, conn *conn) {
-				conn.Close()
-			}),
-		),
-		handlerEx: handler,
+		nat:        newCache[K](maxAge, maxEntries),
+		handlerEx:  handler,
+		dropOnFull: dropOnFull,
 	}
 	return service
+}
+
+func newCache[K comparable](maxAge int64, maxEntries int) *cache.LruCache[K, *conn] {
+	options := []cache.Option[K, *conn]{
+		cache.WithAge[K, *conn](maxAge),
+		cache.WithUpdateAgeOnGet[K, *conn](),
+		cache.WithEvict[K, *conn](func(key K, conn *conn) {
+			conn.Close()
+		}),
+	}
+	if maxEntries > 0 {
+		options = append(options, cache.WithSize[K, *conn](maxEntries))
+	}
+	return cache.New(options...)
 }
 
 func (s *Service[T]) WriteIsThreadUnsafe() {
@@ -109,6 +127,18 @@ func (s *Service[T]) NewContextPacketEx(ctx context.Context, key T, buffer *buf.
 			readDeadline: pipe.MakeDeadline(),
 		}
 		c.ctx, c.cancel = context.WithCancelCause(ctx)
+		c.timeout = func() time.Duration {
+			current, lifetime, loaded := s.nat.PeekWithLifetime(key)
+			if !loaded || current != c {
+				return 0
+			}
+			return time.Until(lifetime)
+		}
+		c.setTimeout = func(timeout time.Duration) bool {
+			return s.nat.UpdateLifetime(key, func(current *conn) bool {
+				return current == c
+			}, timeout)
+		}
 		return c
 	})
 	if !loaded {
@@ -116,7 +146,7 @@ func (s *Service[T]) NewContextPacketEx(ctx context.Context, key T, buffer *buf.
 		go func() {
 			if s.handlerEx != nil {
 				s.handlerEx.NewPacketConnectionEx(ctx, c, source, destination, func(err error) {
-					s.nat.Delete(key)
+					s.deleteIfCurrent(key, c)
 				})
 			} else {
 				//nolint:staticcheck
@@ -128,21 +158,38 @@ func (s *Service[T]) NewContextPacketEx(ctx context.Context, key T, buffer *buf.
 					s.handler.NewError(ctx, err)
 				}
 				c.Close()
-				s.nat.Delete(key)
+				s.deleteIfCurrent(key, c)
 			}
 		}()
 	}
 	if common.Done(c.ctx) {
-		s.nat.Delete(key)
+		s.deleteIfCurrent(key, c)
 		if !common.Done(ctx) {
 			s.NewContextPacketEx(ctx, key, buffer, source, destination, init)
+		} else {
+			buffer.Release()
 		}
 		return
 	}
-	c.data <- packet{
+	nextPacket := packet{
 		data:        buffer,
 		destination: destination,
 	}
+	if s.dropOnFull {
+		select {
+		case c.data <- nextPacket:
+		default:
+			buffer.Release()
+		}
+	} else {
+		c.data <- nextPacket
+	}
+}
+
+func (s *Service[K]) deleteIfCurrent(key K, c *conn) {
+	s.nat.DeleteIf(key, func(current *conn) bool {
+		return current == c
+	})
 }
 
 type packet struct {
@@ -161,6 +208,22 @@ type conn struct {
 	source          N.PacketWriter
 	readDeadline    pipe.Deadline
 	readWaitOptions N.ReadWaitOptions
+	timeout         func() time.Duration
+	setTimeout      func(time.Duration) bool
+}
+
+func (c *conn) Timeout() time.Duration {
+	if c.timeout == nil {
+		return 0
+	}
+	return c.timeout()
+}
+
+func (c *conn) SetTimeout(timeout time.Duration) bool {
+	if c.setTimeout == nil {
+		return false
+	}
+	return c.setTimeout(timeout)
 }
 
 func (c *conn) ReadPacket(buffer *buf.Buffer) (addr M.Socksaddr, err error) {
