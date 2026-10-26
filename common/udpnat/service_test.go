@@ -3,6 +3,7 @@ package udpnat
 import (
 	"context"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,25 +32,94 @@ func (h testHandler) NewPacketConnection(_ context.Context, conn N.PacketConn, _
 
 func (h testHandler) NewError(context.Context, error) {}
 
-type testExHandler struct {
-}
-
-func (h testExHandler) NewPacketConnectionEx(_ context.Context, conn N.PacketConn, _, _ M.Socksaddr, _ N.CloseHandlerFunc) {
-	for {
-		packet := buf.NewSize(1)
-		_, err := conn.ReadPacket(packet)
-		packet.Release()
-		if err != nil {
-			return
-		}
-	}
-}
-
 type testWriter struct{}
 
 func (testWriter) WritePacket(buffer *buf.Buffer, _ M.Socksaddr) error {
 	buffer.Release()
 	return nil
+}
+
+type gatedSession struct {
+	conn        *conn
+	release     chan struct{}
+	releaseOnce sync.Once
+	exited      chan struct{}
+}
+
+func (s *gatedSession) unblock() {
+	s.releaseOnce.Do(func() { close(s.release) })
+}
+
+func (s *gatedSession) drain() {
+	for {
+		select {
+		case packet := <-s.conn.data:
+			packet.data.Release()
+		default:
+			return
+		}
+	}
+}
+
+// gatedHandler deliberately never reads packets. It reports the session first,
+// then waits for eviction/close and the test's release gate before running the
+// service's cleanup callback.
+type gatedHandler struct {
+	ready chan *gatedSession
+}
+
+func (h gatedHandler) NewPacketConnectionEx(_ context.Context, packetConn N.PacketConn, _, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
+	session := &gatedSession{
+		conn:    packetConn.(*conn),
+		release: make(chan struct{}),
+		exited:  make(chan struct{}),
+	}
+	h.ready <- session
+	<-session.conn.ctx.Done()
+	<-session.release
+	onClose(nil)
+	close(session.exited)
+}
+
+func newGatedService(capacity int) (*Service[netip.AddrPort], gatedHandler) {
+	handler := gatedHandler{ready: make(chan *gatedSession, capacity+2)}
+	return NewExWithCapacity[netip.AddrPort](60, capacity, true, handler), handler
+}
+
+func (h gatedHandler) wait(t *testing.T) *gatedSession {
+	t.Helper()
+	select {
+	case session := <-h.ready:
+		return session
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not start")
+		return nil
+	}
+}
+
+func gatedSend(service *Service[netip.AddrPort], key netip.AddrPort) {
+	buffer := buf.NewSize(1)
+	_, _ = buffer.Write([]byte("x"))
+	service.NewPacketEx(context.Background(), key, buffer, M.SocksaddrFromNetIP(key), M.ParseSocksaddr("127.0.0.1:9"), func(N.PacketConn) N.PacketWriter {
+		return testWriter{}
+	})
+}
+
+func cleanupGated(t *testing.T, service *Service[netip.AddrPort], sessions []*gatedSession) {
+	t.Helper()
+	for _, session := range sessions {
+		_ = session.conn.Close()
+		session.unblock()
+	}
+	service.nat.Clear()
+	for _, session := range sessions {
+		select {
+		case <-session.exited:
+		case <-time.After(2 * time.Second):
+			t.Errorf("handler did not exit")
+		}
+		session.drain()
+	}
 }
 
 func newPacket(service *Service[netip.AddrPort], key netip.AddrPort, destination M.Socksaddr) {
@@ -89,24 +159,59 @@ func TestNewWithCapacityEvictsOldest(t *testing.T) {
 	}
 }
 
-func TestClosedSessionDoesNotDeleteReusedKey(t *testing.T) {
-	returned := make(chan struct{}, 1)
-	service := NewWithCapacity[netip.AddrPort](60, 1, true, testHandler{returned: returned})
-	defer service.nat.Clear()
+func reuseSessions(t *testing.T) (*Service[netip.AddrPort], []*gatedSession, *gatedSession, *gatedSession) {
+	t.Helper()
+	service, handler := newGatedService(1)
+	sessions := make([]*gatedSession, 0, 3)
+	t.Cleanup(func() { cleanupGated(t, service, sessions) })
 
-	destination := M.ParseSocksaddr("127.0.0.1:9")
 	first := netip.MustParseAddrPort("127.0.0.1:1")
 	second := netip.MustParseAddrPort("127.0.0.1:2")
-	newPacket(service, first, destination)
-	newPacket(service, second, destination)
+	gatedSend(service, first)
+	oldFirst := handler.wait(t)
+	sessions = append(sessions, oldFirst)
+	gatedSend(service, second)
+	sessions = append(sessions, handler.wait(t))
+	gatedSend(service, first)
+	newFirst := handler.wait(t)
+	sessions = append(sessions, newFirst)
+	return service, sessions, oldFirst, newFirst
+}
 
+func TestOldSessionCleanupDoesNotDeleteReusedKey(t *testing.T) {
+	service, _, oldFirst, newFirst := reuseSessions(t)
+	first := netip.MustParseAddrPort("127.0.0.1:1")
+
+	// The old generation is already evicted, but its cleanup has been held
+	// back until the replacement for the same source key exists.
+	oldFirst.unblock()
 	select {
-	case <-returned:
-	case <-time.After(time.Second):
-		t.Fatal("evicted session handler did not return")
+	case <-oldFirst.exited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old session cleanup did not run")
 	}
-	if !service.nat.Exist(second) {
-		t.Fatal("closing the evicted session deleted the reused key")
+
+	current, _, ok := service.nat.PeekWithLifetime(first)
+	if !ok {
+		t.Fatal("replacement session disappeared")
+	}
+	if current != newFirst.conn {
+		t.Fatal("old session cleanup deleted the replacement source key")
+	}
+}
+
+func TestOldSessionCannotUpdateReusedLifetime(t *testing.T) {
+	service, _, oldFirst, newFirst := reuseSessions(t)
+
+	if oldFirst.conn.SetTimeout(time.Hour) {
+		t.Fatal("evicted generation refreshed the replacement lifetime")
+	}
+	current, _, ok := service.nat.PeekWithLifetime(netip.MustParseAddrPort("127.0.0.1:1"))
+	if !ok || current != newFirst.conn {
+		t.Fatal("replacement session was not current")
+	}
+	if !newFirst.conn.SetTimeout(time.Hour) {
+		t.Fatal("current generation could not refresh its own lifetime")
 	}
 }
 
@@ -131,47 +236,53 @@ func TestConnTimeoutUpdatesLifetime(t *testing.T) {
 	}
 }
 
-func TestEvictedConnCannotUpdateReusedLifetime(t *testing.T) {
-	service := NewWithCapacity[netip.AddrPort](60, 1, true, testHandler{})
-	defer service.nat.Clear()
-
-	first := netip.MustParseAddrPort("127.0.0.1:1")
-	second := netip.MustParseAddrPort("127.0.0.1:2")
-	newPacket(service, first, M.ParseSocksaddr("127.0.0.1:9"))
-	old, loaded := service.nat.Load(first)
-	if !loaded {
-		t.Fatal("first session not cached")
-	}
-	newPacket(service, second, M.ParseSocksaddr("127.0.0.1:9"))
-	if old.SetTimeout(time.Minute) {
-		t.Fatal("evicted session refreshed a lifetime")
-	}
-}
-
 func TestNewExWithCapacityDropsWhenQueueFull(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	service := NewExWithCapacity[netip.AddrPort](60, 10, true, testExHandler{})
-	defer service.nat.Clear()
+	service, handler := newGatedService(1)
+	sessions := make([]*gatedSession, 0, 1)
+	t.Cleanup(func() { cleanupGated(t, service, sessions) })
 
 	key := netip.MustParseAddrPort("127.0.0.1:1")
-	destination := M.ParseSocksaddr("127.0.0.1:9")
+	gatedSend(service, key)
+	session := handler.wait(t)
+	sessions = append(sessions, session)
+
+	// The gated handler never reads. The first datagram is queued before the
+	// handler starts; 63 more fill the remaining slots.
+	for range 63 {
+		gatedSend(service, key)
+	}
+	if got := len(session.conn.data); got != cap(session.conn.data) {
+		t.Fatalf("queue depth=%d, want full capacity %d", got, cap(session.conn.data))
+	}
+
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		// The handler above never reads. The nonblocking queue must drop
-		// packets after its 64 slots instead of blocking this loop.
-		for range 65 {
-			buffer := buf.NewSize(1)
-			_, _ = buffer.Write([]byte("x"))
-			service.NewPacketEx(ctx, key, buffer, M.SocksaddrFromNetIP(key), destination, func(N.PacketConn) N.PacketWriter {
-				return testWriter{}
-			})
-		}
+		gatedSend(service, key)
 	}()
+	blocked := false
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("full session queue blocked the shared reader")
+		blocked = true
+		// Unblock a mutated blocking enqueue so cleanup and the mutation
+		// diagnostic can finish instead of hanging the test process.
+		select {
+		case packet := <-session.conn.data:
+			packet.data.Release()
+		case <-time.After(time.Second):
+			t.Fatal("full queue could not be drained")
+		}
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("blocked enqueue did not finish after draining one slot")
+		}
+	}
+	if blocked {
+		t.Error("65th datagram blocked instead of being dropped when the queue was full")
+	}
+	if got := len(session.conn.data); got != cap(session.conn.data) {
+		t.Fatalf("queue depth=%d after the 65th datagram, want %d", got, cap(session.conn.data))
 	}
 }
