@@ -143,22 +143,31 @@ func (s *Service[T]) NewContextPacketEx(ctx context.Context, key T, buffer *buf.
 	})
 	if !loaded {
 		ctx, c.source = init(c)
+		handlerCtx, cancelHandler := context.WithCancelCause(ctx)
+		// init may replace the parent context. Retain its values and cancellation
+		// while also canceling in-flight handler work when the session closes.
+		stop := context.AfterFunc(c.ctx, func() {
+			cancelHandler(context.Cause(c.ctx))
+		})
+		onClose := func(err error) {
+			stop()
+			cancelHandler(err)
+			s.deleteIfCurrent(key, c)
+		}
 		go func() {
 			if s.handlerEx != nil {
-				s.handlerEx.NewPacketConnectionEx(ctx, c, source, destination, func(err error) {
-					s.deleteIfCurrent(key, c)
-				})
+				s.handlerEx.NewPacketConnectionEx(handlerCtx, c, source, destination, onClose)
 			} else {
 				//nolint:staticcheck
-				err := s.handler.NewPacketConnection(ctx, c, M.Metadata{
+				err := s.handler.NewPacketConnection(handlerCtx, c, M.Metadata{
 					Source:      source,
 					Destination: destination,
 				})
 				if err != nil {
-					s.handler.NewError(ctx, err)
+					s.handler.NewError(handlerCtx, err)
 				}
 				c.Close()
-				s.deleteIfCurrent(key, c)
+				onClose(err)
 			}
 		}()
 	}
